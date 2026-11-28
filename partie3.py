@@ -48,7 +48,7 @@ def comparer(nom, df, cle=None, tol=0.011):
 
 
 q0 = pandas.DataFrame([{
-    "nb_customer_id": db.commandes.count_documents({}),
+    "nb_customer_id": compter("clients", [{"$group": {"_id": None, "n": {"$sum": {"$size": "$customer_ids"}}}}]),
     "nb_personnes_reelles": db.clients.count_documents({}),
     "nb_commandes": db.commandes.count_documents({}),
     "nb_commandes_livrees": db.commandes.count_documents({"statut": "delivered"}),
@@ -56,8 +56,27 @@ q0 = pandas.DataFrame([{
     "nb_review_id_distincts": compter("commandes", [{"$unwind": "$avis"}, {"$group": {"_id": "$avis.id"}}, {"$count": "n"}]),
     "nb_avis_sans_commentaire": compter("commandes", [{"$unwind": "$avis"}, {"$match": {"avis.commentaire": {"$exists": False}}}, {"$count": "n"}]),
     "nb_produits_sans_categorie": db.produits.count_documents({"categorie_pt": {"$exists": False}}),
+    "nb_produits_categorie_sans_traduction": db.produits.count_documents({"categorie_pt": {"$exists": True}, "categorie_en": {"$exists": False}}),
+    "nb_commandes_sans_avis": db.commandes.count_documents({"avis": {"$size": 0}}),
+    "nb_commandes_plusieurs_avis": db.commandes.count_documents({"avis.1": {"$exists": True}}),
+    "nb_commandes_plusieurs_articles": db.commandes.count_documents({"articles.1": {"$exists": True}}),
+    "nb_commandes_plusieurs_paiements": db.commandes.count_documents({"paiements.1": {"$exists": True}}),
+    "nb_commandes_sans_article": db.commandes.count_documents({"articles": {"$size": 0}}),
 }])
 comparer("q0_exploration", q0)
+
+df = executer("commandes", [
+    {"$group": {"_id": "$statut", "nb_commandes": {"$sum": 1},
+                "sans_date_approbation": {"$sum": {"$cond": [{"$ifNull": ["$dates.approbation", False]}, 0, 1]}},
+                "sans_date_transporteur": {"$sum": {"$cond": [{"$ifNull": ["$dates.remise_transporteur", False]}, 0, 1]}},
+                "sans_date_livraison": {"$sum": {"$cond": [{"$ifNull": ["$dates.livraison_client", False]}, 0, 1]}}}},
+    {"$sort": {"nb_commandes": -1}},
+])
+df = df.rename(columns={"_id": "statut"})
+comparer("q0_statuts", df[["statut", "nb_commandes", "sans_date_approbation", "sans_date_transporteur", "sans_date_livraison"]], ["statut"])
+
+print("geolocalisation :", db.geolocalisation.count_documents({}), "préfixes migrés sur",
+      int(pandas.read_csv("resultats_sqlite/q0_geolocalisation.csv").nb_prefixes[0]), "(préfixes dont tous les points sont hors du Brésil écartés)")
 
 df = executer("commandes", [
     {"$match": {"statut": "delivered", "articles.0": {"$exists": True}}},
@@ -160,27 +179,32 @@ df = df.rename(columns={"_id": "mois_achat"})
 df["taux_a_l_heure_pct"] = (100 * df.taux).round(2)
 comparer("q1g_taux_heure_mensuel", df[["mois_achat", "nb_livrees", "taux_a_l_heure_pct"]], ["mois_achat"])
 
-clients = executer("commandes", [
+df = executer("commandes", [
     {"$group": {"_id": {"e": "$client.etat", "u": "$client.unique_id"}}},
     {"$group": {"_id": "$_id.e", "nb_clients": {"$sum": 1}}},
-]).rename(columns={"_id": "etat"})
-vendeurs = executer("vendeurs", [
-    {"$group": {"_id": "$etat", "nb_vendeurs": {"$sum": 1}}},
-]).rename(columns={"_id": "etat"})
-geo = executer("geolocalisation", [
-    {"$addFields": {"lng": {"$arrayElemAt": ["$location.coordinates", 0]},
-                    "lat": {"$arrayElemAt": ["$location.coordinates", 1]}}},
-    {"$group": {"_id": "$etat",
-                "sum_lat": {"$sum": {"$multiply": ["$lat", "$nb_points"]}},
-                "sum_lng": {"$sum": {"$multiply": ["$lng", "$nb_points"]}},
-                "nb": {"$sum": "$nb_points"}}},
-]).rename(columns={"_id": "etat"})
-geo["centroide_lat"] = (geo.sum_lat / geo.nb).round(5)
-geo["centroide_lng"] = (geo.sum_lng / geo.nb).round(5)
-df = clients.merge(vendeurs, on="etat", how="left").merge(geo[["etat", "centroide_lat", "centroide_lng"]], on="etat", how="left")
-df["nb_vendeurs"] = df.nb_vendeurs.fillna(0).astype(int)
-df["ratio_clients_par_vendeur"] = (df.nb_clients / df.nb_vendeurs.replace(0, numpy.nan)).round(1)
-df = df.sort_values("ratio_clients_par_vendeur", ascending=False)
+    {"$lookup": {"from": "vendeurs", "localField": "_id", "foreignField": "etat", "as": "vendeurs"}},
+    {"$lookup": {"from": "geolocalisation", "localField": "_id", "foreignField": "etat", "as": "geo"}},
+    {"$unwind": "$geo"},
+    {"$addFields": {"lng": {"$arrayElemAt": ["$geo.location.coordinates", 0]},
+                    "lat": {"$arrayElemAt": ["$geo.location.coordinates", 1]}}},
+    {"$group": {"_id": "$_id",
+                "nb_clients": {"$first": "$nb_clients"},
+                "nb_vendeurs": {"$first": {"$size": "$vendeurs"}},
+                "sum_lat": {"$sum": {"$multiply": ["$lat", "$geo.nb_points"]}},
+                "sum_lng": {"$sum": {"$multiply": ["$lng", "$geo.nb_points"]}},
+                "nb_points": {"$sum": "$geo.nb_points"}}},
+    {"$project": {
+        "nb_clients": 1, "nb_vendeurs": 1,
+        "ratio_clients_par_vendeur": {"$cond": [{"$gt": ["$nb_vendeurs", 0]}, {"$divide": ["$nb_clients", "$nb_vendeurs"]}, None]},
+        "centroide_lat": {"$divide": ["$sum_lat", "$nb_points"]},
+        "centroide_lng": {"$divide": ["$sum_lng", "$nb_points"]},
+    }},
+    {"$sort": {"ratio_clients_par_vendeur": -1}},
+])
+df = df.rename(columns={"_id": "etat"})
+df["ratio_clients_par_vendeur"] = df.ratio_clients_par_vendeur.astype(float).round(1)
+df["centroide_lat"] = df.centroide_lat.round(5)
+df["centroide_lng"] = df.centroide_lng.round(5)
 comparer("q1h_expansion_etat", df[["etat", "nb_clients", "nb_vendeurs", "ratio_clients_par_vendeur", "centroide_lat", "centroide_lng"]], ["etat"], 0.1)
 
 TRANCHE = {"$cond": [{"$lte": ["$retard_jours", 0]}, "1 - a l'heure",

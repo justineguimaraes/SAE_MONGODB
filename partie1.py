@@ -5,6 +5,7 @@ import os
 conn = sqlite3.connect("olist.sqlite")
 os.makedirs("resultats_sqlite", exist_ok=True)
 
+# Exploration : 96 096 personnes réelles pour 99 441 customer_id, review_id en double, 58 % d'avis sans commentaire -> un client par customer_unique_id et des avis imbriqués dans la commande
 q0 = """
 SELECT
 (SELECT COUNT(*) FROM customers) AS nb_customer_id,
@@ -14,12 +15,50 @@ SELECT
 (SELECT COUNT(*) FROM order_reviews) AS nb_avis,
 (SELECT COUNT(DISTINCT review_id) FROM order_reviews) AS nb_review_id_distincts,
 (SELECT COUNT(*) FROM order_reviews WHERE review_comment_message IS NULL) AS nb_avis_sans_commentaire,
-(SELECT COUNT(*) FROM products WHERE product_category_name IS NULL) AS nb_produits_sans_categorie
+(SELECT COUNT(*) FROM products WHERE product_category_name IS NULL) AS nb_produits_sans_categorie,
+(SELECT COUNT(*) FROM products p LEFT JOIN category_translation t ON t.product_category_name = p.product_category_name
+WHERE p.product_category_name IS NOT NULL AND t.product_category_name_english IS NULL) AS nb_produits_categorie_sans_traduction,
+(SELECT COUNT(*) FROM orders WHERE order_id NOT IN (SELECT order_id FROM order_reviews)) AS nb_commandes_sans_avis,
+(SELECT COUNT(*) FROM (SELECT order_id FROM order_reviews GROUP BY order_id HAVING COUNT(*) >= 2)) AS nb_commandes_plusieurs_avis,
+(SELECT COUNT(*) FROM (SELECT order_id FROM order_items GROUP BY order_id HAVING COUNT(*) >= 2)) AS nb_commandes_plusieurs_articles,
+(SELECT COUNT(*) FROM (SELECT order_id FROM order_payments GROUP BY order_id HAVING COUNT(*) >= 2)) AS nb_commandes_plusieurs_paiements,
+(SELECT COUNT(*) FROM orders WHERE order_id NOT IN (SELECT order_id FROM order_items)) AS nb_commandes_sans_article
 """
 df = pandas.read_sql_query(q0, conn)
 df.to_csv("resultats_sqlite/q0_exploration.csv", index=False)
 print(df)
 
+# Exploration : seules les commandes delivered ont une date de livraison (sauf 8) -> les délais se calculent uniquement sur les commandes livrées
+q0_statuts = """
+SELECT order_status AS statut,
+COUNT(*) AS nb_commandes,
+SUM(order_approved_at IS NULL) AS sans_date_approbation,
+SUM(order_delivered_carrier_date IS NULL) AS sans_date_transporteur,
+SUM(order_delivered_customer_date IS NULL) AS sans_date_livraison
+FROM orders
+GROUP BY order_status
+ORDER BY nb_commandes DESC
+"""
+df = pandas.read_sql_query(q0_statuts, conn)
+df.to_csv("resultats_sqlite/q0_statuts.csv", index=False)
+print(df)
+
+# Exploration : 1 million de points pour 19 015 préfixes, plusieurs noms de ville par préfixe et 40 points hors du Brésil -> agréger par préfixe et normaliser les villes
+q0_geo = """
+SELECT COUNT(*) AS nb_points,
+COUNT(DISTINCT geolocation_zip_code_prefix) AS nb_prefixes,
+COUNT(DISTINCT geolocation_city) AS nb_noms_villes,
+COUNT(DISTINCT LOWER(TRIM(geolocation_city))) AS nb_noms_villes_minuscules,
+(SELECT COUNT(*) FROM (SELECT geolocation_zip_code_prefix FROM geolocation
+ GROUP BY geolocation_zip_code_prefix HAVING COUNT(DISTINCT geolocation_city) >= 2)) AS nb_prefixes_plusieurs_noms,
+SUM(geolocation_lat NOT BETWEEN -35 AND 6 OR geolocation_lng NOT BETWEEN -75 AND -34) AS nb_points_hors_bresil
+FROM geolocation
+"""
+df = pandas.read_sql_query(q0_geo, conn)
+df.to_csv("resultats_sqlite/q0_geolocalisation.csv", index=False)
+print(df)
+
+# a) Directeur général : le CA progresse jusqu'au pic de novembre 2017 (1,15 M R$, Black Friday) puis se stabilise autour de 1 M R$ par mois -> anticiper les fins d'année
 qa = """
 WITH ca_commande AS (
 SELECT order_id, SUM(price + freight_value) AS ca
@@ -39,6 +78,7 @@ df = pandas.read_sql_query(qa, conn)
 df.to_csv("resultats_sqlite/q1a_ca_mensuel.csv", index=False)
 print(df)
 
+# b) Directeur commercial : le panier moyen est plus élevé dans le Nord-Est (PB 267 R$) que dans le Sud-Est (SP 142 R$) -> cibler les offres premium sur ces États
 qb = """
 WITH paiement_commande AS (
 SELECT order_id, SUM(payment_value) AS total
@@ -59,6 +99,7 @@ df = pandas.read_sql_query(qb, conn)
 df.to_csv("resultats_sqlite/q1b_panier_moyen_etat.csv", index=False)
 print(df)
 
+# c) Directeur commercial : les 10 premières catégories font 62 % du CA, santé-beauté en tête (9,2 %) -> concentrer catalogue et marketing sur ces catégories
 qc = """
 WITH ca_cat AS (
 SELECT COALESCE(t.product_category_name_english, p.product_category_name, 'inconnue') AS categorie,
@@ -85,6 +126,7 @@ df = pandas.read_sql_query(qc, conn)
 df.to_csv("resultats_sqlite/q1c_top_categories.csv", index=False)
 print(df)
 
+# d) Directeur logistique : un client de RR attend 29 jours contre 9 à SP, et AL a 24 % de retards -> renégocier les transporteurs du Nord et du Nord-Est
 qd = """
 SELECT cu.customer_state AS etat,
 ROUND(AVG(julianday(o.order_delivered_customer_date) - julianday(o.order_purchase_timestamp)), 2) AS delai_moyen_jours,
@@ -100,6 +142,7 @@ df = pandas.read_sql_query(qd, conn)
 df.to_csv("resultats_sqlite/q1d_delai_retard_etat.csv", index=False)
 print(df)
 
+# e) Responsable marketplace : ces 10 vendeurs pèsent chacun 200 000 à 250 000 R$ de CA -> les fidéliser en priorité, en surveillant ceux notés 3,5
 qe = """
 WITH rev AS (
 SELECT order_id, AVG(review_score) AS score
@@ -127,6 +170,7 @@ df = pandas.read_sql_query(qe, conn)
 df.to_csv("resultats_sqlite/q1e_top_vendeurs.csv", index=False)
 print(df)
 
+# f) Responsable qualité : ces vendeurs livrent à l'heure mais sont mal notés -> le problème vient du produit ou de sa description, pas de la livraison
 qf = """
 WITH rev AS (
 SELECT order_id, AVG(review_score) AS score
@@ -166,6 +210,7 @@ for s in seuils:
 df.to_csv("resultats_sqlite/q1f_vendeurs_mal_notes_ponctuels.csv", index=False)
 print(df)
 
+# g) Directeur logistique : 91,9 % des commandes arrivent à l'heure en moyenne
 qg1 = """
 SELECT COUNT(*) AS nb_livrees,
 SUM(order_delivered_customer_date <= order_estimated_delivery_date) AS nb_a_l_heure,
@@ -178,6 +223,7 @@ df = pandas.read_sql_query(qg1, conn)
 df.to_csv("resultats_sqlite/q1g_taux_heure_global.csv", index=False)
 print(df)
 
+# g) Directeur logistique : le taux chute à 85,7 % en novembre 2017 et 78,6 % en mars 2018 -> renforcer les transporteurs avant les pics
 qg2 = """
 SELECT strftime('%Y-%m', order_purchase_timestamp) AS mois_achat,
 COUNT(*) AS nb_livrees,
@@ -192,6 +238,7 @@ df = pandas.read_sql_query(qg2, conn)
 df.to_csv("resultats_sqlite/q1g_taux_heure_mensuel.csv", index=False)
 print(df)
 
+# h) Directeur de l'expansion : PA, MA et PI n'ont qu'un vendeur pour des centaines de clients -> recruter des vendeurs locaux dans ces États
 qh = """
 WITH cl AS (
 SELECT customer_state AS etat, COUNT(DISTINCT customer_unique_id) AS nb_clients
@@ -225,6 +272,7 @@ df = pandas.read_sql_query(qh, conn)
 df.to_csv("resultats_sqlite/q1h_expansion_etat.csv", index=False)
 print(df)
 
+# i) Responsable satisfaction : la note passe de 4,29 à l'heure à 1,73 au-delà de 7 jours de retard -> traiter en priorité les colis en retard
 qi1 = """
 WITH rev AS (
 SELECT order_id, AVG(review_score) AS score
@@ -253,6 +301,7 @@ df = pandas.read_sql_query(qi1, conn)
 df.to_csv("resultats_sqlite/q1i_note_par_tranche_retard.csv", index=False)
 print(df)
 
+# i) Responsable satisfaction : la corrélation retard/note est la plus forte en CE, AL et PA (-0,47) -> la ponctualité y est le premier levier de satisfaction
 qi2 = """
 WITH rev AS (
 SELECT order_id, AVG(review_score) AS score
@@ -284,6 +333,7 @@ df = df.sort_values("correlation_retard_note")
 df.to_csv("resultats_sqlite/q1i_correlation_retard_note_etat.csv", index=False)
 print(df)
 
+# j) Directeur financier : la carte de crédit porte 78 % de la valeur avec 3,5 échéances en moyenne -> négocier ses frais et garder le paiement en plusieurs fois
 qj = """
 WITH tot AS (
 SELECT COUNT(DISTINCT order_id) AS nb_cmd, SUM(payment_value) AS valeur
@@ -303,6 +353,7 @@ df = pandas.read_sql_query(qj, conn)
 df.to_csv("resultats_sqlite/q1j_moyens_paiement.csv", index=False)
 print(df)
 
+# k) Responsable vendeurs : ces vendeurs mettent jusqu'à 18 jours pour remettre le colis au transporteur -> les accompagner ou les pénaliser
 qk = """
 WITH vc AS (
 SELECT DISTINCT oi.seller_id, oi.order_id
@@ -323,6 +374,7 @@ df = pandas.read_sql_query(qk, conn)
 df.to_csv("resultats_sqlite/q1k_vendeurs_lents.csv", index=False)
 print(df)
 
+# l) Directeur marketing : seuls 3 % des clients repassent commande, et moins de 2 % en CE et AP -> lancer des actions de fidélisation
 ql = """
 WITH cmd AS (
 SELECT cu.customer_unique_id AS uid, cu.customer_state AS etat,
@@ -345,6 +397,7 @@ df = pandas.read_sql_query(ql, conn)
 df.to_csv("resultats_sqlite/q1l_clients_recurrents_etat.csv", index=False)
 print(df)
 
+# m) Directeur logistique : la note moyenne passe de 4,41 pour une livraison rapide à 3,65 pour une livraison lente -> réduire les livraisons lentes dans chaque État
 qm = """
 WITH rev AS (
 SELECT order_id, AVG(review_score) AS score
@@ -374,6 +427,7 @@ df = pandas.read_sql_query(qm, conn)
 df.to_csv("resultats_sqlite/q1m_classes_livraison_etat.csv", index=False)
 print(df)
 
+# n) Poids du port dans le prix : la note baisse de 4,13 à 3,89 quand le port dépasse le prix de l'article -> proposer la livraison offerte au-dessus d'un seuil de panier
 qn = """
 WITH rev AS (
 SELECT order_id, AVG(review_score) AS score

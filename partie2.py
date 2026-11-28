@@ -3,6 +3,7 @@ import pandas
 import pymongo
 import unicodedata
 from collections import defaultdict
+from pprint import pprint
 
 conn = sqlite3.connect("olist.sqlite")
 
@@ -185,9 +186,21 @@ db.commandes.create_index("client.unique_id")
 db.commandes.create_index("articles.vendeur_id")
 db.commandes.create_index("articles.categorie")
 db.geolocalisation.create_index([("location", pymongo.GEOSPHERE)])
+db.geolocalisation.create_index("etat")
 db.vendeurs.create_index([("location", pymongo.GEOSPHERE)])
 db.vendeurs.create_index("etat")
 db.clients.create_index("nb_commandes")
 
 for nom in ["commandes", "clients", "vendeurs", "produits", "geolocalisation"]:
     print(nom, db[nom].count_documents({}))
+
+exemples = {
+    "commandes": {"articles.1": {"$exists": True}, "avis.commentaire": {"$exists": True}},
+    "clients": {"nb_commandes": {"$gte": 2}},
+    "vendeurs": {},
+    "produits": {"categorie_en": {"$exists": True}},
+    "geolocalisation": {},
+}
+for nom, filtre in exemples.items():
+    print("\nSchéma type de la collection", nom)
+    pprint(db[nom].find_one(filtre))
